@@ -260,9 +260,9 @@ def parse_docx(path: str) -> list[tuple[str, list[str]]]:
 
 
 class AIRequestLimiter:
-    """Simple persistent-in-process pacing for low RPM API accounts."""
-    def __init__(self, min_interval: float = 6.2):
-        self.min_interval = min_interval
+    """Pace API calls so the bot does not flood low-RPM API projects."""
+    def __init__(self, min_interval: float = 1.25):
+        self.min_interval = max(0.0, min_interval)
         self.lock = asyncio.Lock()
         self.last_request = 0.0
 
@@ -274,50 +274,90 @@ class AIRequestLimiter:
             self.last_request = time.monotonic()
 
 
-ai_limiter = AIRequestLimiter(float(os.getenv("OPENAI_MIN_REQUEST_INTERVAL", "6.2")))
+# A batch dramatically reduces API requests: 60 questions ~= 3 requests instead of 60.
+# Set OPENAI_BATCH_SIZE in Render if desired. 20 is a safe default for long questions.
+OPENAI_BATCH_SIZE = max(1, min(50, int(os.getenv("OPENAI_BATCH_SIZE", "20"))))
+OPENAI_MIN_REQUEST_INTERVAL = max(0.0, float(os.getenv("OPENAI_MIN_REQUEST_INTERVAL", "1.3")))
+ai_limiter = AIRequestLimiter(OPENAI_MIN_REQUEST_INTERVAL)
 
 
-async def ai_answer(question: str, options: list[str]) -> int:
-    numbered = "\n".join(f"{i + 1}. {x}" for i, x in enumerate(options))
-    prompt = f"""Solve this multiple-choice question.
-Return ONLY one integer from 1 to {len(options)} representing the correct option.
-Do not explain your answer.
+def retry_after_seconds(exc: Exception) -> float | None:
+    """Extract a useful retry delay from OpenAI error text when present."""
+    text = str(exc)
+    # Examples: "try again in 6s", "try again in 28m48s", "retry after 60 seconds"
+    m = re.search(r"try again in\s+(?:(\d+)m)?\s*(?:(\d+(?:\.\d+)?)s)?", text, re.I)
+    if m and (m.group(1) or m.group(2)):
+        return int(m.group(1) or 0) * 60 + float(m.group(2) or 0)
+    m = re.search(r"retry[- ]after[:=]?\s*(\d+(?:\.\d+)?)", text, re.I)
+    if m:
+        return float(m.group(1))
+    return None
 
-QUESTION:
-{question}
 
-OPTIONS:
-{numbered}
-"""
+async def ai_answer_batch(items: list[tuple[str, list[str]]]) -> list[int]:
+    """Ask the model for many answers in one request.
+
+    Output must contain exactly one integer per question, in order. This is much
+    more tolerant of low RPM limits than making one request per question.
+    """
+    blocks = []
+    for n, (question, options) in enumerate(items, 1):
+        numbered = "\n".join(f"{i + 1}. {x}" for i, x in enumerate(options))
+        blocks.append(f"QUESTION {n}:\n{question}\nOPTIONS:\n{numbered}")
+    prompt = """Solve these multiple-choice questions.
+Return ONLY the correct option number for each question, one integer per line, in exactly the same order.
+Do not explain anything. Do not add numbering, bullets, or extra text.
+If a question has N options, its answer must be between 1 and N.
+
+""" + "\n\n---\n\n".join(blocks)
+
     response = await ai.responses.create(model=OPENAI_MODEL, input=prompt)
     text = (response.output_text or "").strip()
-    m = re.search(r"\b([1-8])\b", text)
-    if not m:
-        raise ValueError(f"AI returned invalid answer: {text!r}")
-    idx = int(m.group(1)) - 1
-    if idx < 0 or idx >= len(options):
-        raise ValueError("AI answer is outside option range")
-    return idx
+    # The model is instructed to output only integers. Restrict parsing to lines
+    # so numbers appearing in the question text cannot be mistaken for answers.
+    answers = []
+    for line in text.splitlines():
+        m = re.fullmatch(r"\s*(?:answer\s*)?([1-8])\s*[.)]?\s*", line, re.I)
+        if m:
+            answers.append(int(m.group(1)) - 1)
+    if len(answers) != len(items):
+        # Fallback: accept a plain sequence of integers separated by commas/spaces.
+        nums = re.findall(r"(?<!\d)([1-8])(?!\d)", text)
+        if len(nums) == len(items):
+            answers = [int(x) - 1 for x in nums]
+    if len(answers) != len(items):
+        raise ValueError(f"AI returned {len(answers)} answers for {len(items)} questions: {text[:500]!r}")
+    for i, answer in enumerate(answers):
+        if answer < 0 or answer >= len(items[i][1]):
+            raise ValueError(f"AI answer {answer + 1} is outside option range for question {i + 1}")
+    return answers
 
 
 async def solve_questions(items: list[tuple[str, list[str]]], progress_message: Optional[Message] = None) -> list[tuple[str, list[str], int]]:
-    """Solve one-by-one so even 429-limited API accounts don't get flooded.
-    Retries transient rate-limit/server errors with exponential backoff.
+    """Solve questions in batches and survive temporary 429/5xx errors.
+
+    This cannot bypass a hard account quota, but it reduces API calls by roughly
+    OPENAI_BATCH_SIZE times and automatically waits/retries temporary limits.
     """
-    solved = []
+    solved: list[tuple[str, list[str], int]] = []
     total = len(items)
-    for number, item in enumerate(items, 1):
+    for start in range(0, total, OPENAI_BATCH_SIZE):
+        batch = items[start:start + OPENAI_BATCH_SIZE]
+        batch_start = start + 1
         last_exc = None
-        for attempt in range(12):
+        attempt = 0
+        while True:
             try:
                 await ai_limiter.wait_turn()
-                idx = await ai_answer(item[0], item[1])
-                solved.append((item[0], item[1], idx))
-                if progress_message and (number == 1 or number % 10 == 0 or number == total):
+                indices = await ai_answer_batch(batch)
+                solved.extend((q, opts, idx) for (q, opts), idx in zip(batch, indices))
+                done = min(start + len(batch), total)
+                if progress_message:
                     try:
                         await progress_message.edit_text(
-                            f"🧠 AI javoblarni aniqlayapti... <b>{number}/{total}</b>\n"
-                            f"⏳ Jarayon davom etmoqda, botni yopmang."
+                            f"🧠 AI javoblarni aniqlayapti... <b>{done}/{total}</b>\n"
+                            f"📦 {len(batch)} ta savol bitta AI so‘rovda tekshirildi.\n"
+                            f"⏳ Botni yopmang."
                         )
                     except Exception:
                         pass
@@ -325,16 +365,35 @@ async def solve_questions(items: list[tuple[str, list[str]]], progress_message: 
             except Exception as exc:
                 last_exc = exc
                 msg = str(exc).lower()
-                transient = any(x in msg for x in ("429", "rate limit", "rate_limit", "too many requests", "500", "502", "503", "504", "timeout", "temporarily"))
+                transient = any(x in msg for x in (
+                    "429", "rate limit", "rate_limit", "too many requests",
+                    "500", "502", "503", "504", "timeout", "temporarily"
+                ))
                 if not transient:
                     raise
-                delay = min(60.0, max(6.0, 2 ** min(attempt, 5)))
-                log.warning("AI transient error, retry %s/12 in %.1fs: %s", attempt + 1, delay, exc)
+                attempt += 1
+                suggested = retry_after_seconds(exc)
+                # Honor a server-provided short retry delay. For very large
+                # delays, tell the admin instead of hammering the API.
+                delay = suggested if suggested is not None else min(120.0, 5.0 * (2 ** min(attempt - 1, 5)))
+                delay = max(2.0, delay)
+                if progress_message:
+                    try:
+                        mins = int(delay // 60)
+                        secs = int(delay % 60)
+                        wait_text = f"{mins} daqiqa {secs} soniya" if mins else f"{secs} soniya"
+                        await progress_message.edit_text(
+                            f"⏳ OpenAI limiti band. {wait_text} kutib, avtomatik davom etaman.\n"
+                            f"📦 Hozirgi qism: {batch_start}-{start + len(batch)} / {total}\n"
+                            f"❗ Botni yopmang."
+                        )
+                    except Exception:
+                        pass
+                log.warning("AI transient error; retry %s after %.1fs: %s", attempt, delay, exc)
                 await asyncio.sleep(delay)
-        else:
-            raise RuntimeError(f"AI javobini aniqlash 12 marta urinilgandan keyin ham muvaffaqiyatsiz: {last_exc}")
+        if last_exc and not solved:
+            raise RuntimeError(f"AI javoblarini aniqlash muvaffaqiyatsiz: {last_exc}")
     return solved
-
 
 def kb(*rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
