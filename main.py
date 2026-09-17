@@ -17,6 +17,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -119,23 +120,43 @@ def now() -> int:
 
 
 def parse_duration(text: str) -> Optional[int]:
+    """Parse any positive duration. Bare numbers are minutes for compatibility.
+    Explicit units support 1 second and arbitrarily large values.
+    """
     text = text.strip().lower()
+    if not text:
+        return None
+
+    # Bare number = minutes (legacy/Telegram-QuizBot-like convenience).
     if text.isdigit():
         n = int(text)
-        if 10 <= n <= 86400:
-            return n * 60
-    m = re.fullmatch(r"(\d+)\s*(s|sec|soniya|m|min|daqiqa|h|soat)", text)
+        return n * 60 if n >= 1 else None
+
+    m = re.fullmatch(r"(\d+)\s*(s|sec|secs|soniya|sekund|m|min|mins|daqiqa|h|hr|soat|d|kun)", text)
     if not m:
         return None
     n = int(m.group(1))
+    if n < 1:
+        return None
     unit = m.group(2)
-    if unit in {"s", "sec", "soniya"}:
-        sec = n
-    elif unit in {"m", "min", "daqiqa"}:
-        sec = n * 60
-    else:
-        sec = n * 3600
-    return sec if 10 <= sec <= 86400 else None
+    if unit in {"s", "sec", "secs", "soniya", "sekund"}:
+        return n
+    if unit in {"m", "min", "mins", "daqiqa"}:
+        return n * 60
+    if unit in {"h", "hr", "soat"}:
+        return n * 3600
+    return n * 86400
+
+
+def format_duration(sec: int) -> str:
+    sec = max(1, int(sec))
+    if sec < 60:
+        return f"{sec} soniya"
+    if sec % 3600 == 0:
+        return f"{sec // 3600} soat"
+    if sec % 60 == 0:
+        return f"{sec // 60} daqiqa"
+    return f"{sec // 60} daqiqa {sec % 60} soniya"
 
 
 def clean_text(s: str) -> str:
@@ -238,6 +259,24 @@ def parse_docx(path: str) -> list[tuple[str, list[str]]]:
     return parse_txt("\n".join(paragraphs))
 
 
+class AIRequestLimiter:
+    """Simple persistent-in-process pacing for low RPM API accounts."""
+    def __init__(self, min_interval: float = 6.2):
+        self.min_interval = min_interval
+        self.lock = asyncio.Lock()
+        self.last_request = 0.0
+
+    async def wait_turn(self):
+        async with self.lock:
+            wait = self.min_interval - (time.monotonic() - self.last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.last_request = time.monotonic()
+
+
+ai_limiter = AIRequestLimiter(float(os.getenv("OPENAI_MIN_REQUEST_INTERVAL", "6.2")))
+
+
 async def ai_answer(question: str, options: list[str]) -> int:
     numbered = "\n".join(f"{i + 1}. {x}" for i, x in enumerate(options))
     prompt = f"""Solve this multiple-choice question.
@@ -250,10 +289,7 @@ QUESTION:
 OPTIONS:
 {numbered}
 """
-    response = await ai.responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-    )
+    response = await ai.responses.create(model=OPENAI_MODEL, input=prompt)
     text = (response.output_text or "").strip()
     m = re.search(r"\b([1-8])\b", text)
     if not m:
@@ -264,22 +300,40 @@ OPTIONS:
     return idx
 
 
-async def solve_questions(items: list[tuple[str, list[str]]]) -> list[tuple[str, list[str], int]]:
-    sem = asyncio.Semaphore(5)
-
-    async def one(item):
-        async with sem:
-            for attempt in range(3):
-                try:
-                    idx = await ai_answer(item[0], item[1])
-                    return item[0], item[1], idx
-                except Exception as exc:
-                    log.warning("AI question failed (%s), retry %s", exc, attempt + 1)
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(2 ** attempt)
-
-    return await asyncio.gather(*(one(item) for item in items))
+async def solve_questions(items: list[tuple[str, list[str]]], progress_message: Optional[Message] = None) -> list[tuple[str, list[str], int]]:
+    """Solve one-by-one so even 429-limited API accounts don't get flooded.
+    Retries transient rate-limit/server errors with exponential backoff.
+    """
+    solved = []
+    total = len(items)
+    for number, item in enumerate(items, 1):
+        last_exc = None
+        for attempt in range(12):
+            try:
+                await ai_limiter.wait_turn()
+                idx = await ai_answer(item[0], item[1])
+                solved.append((item[0], item[1], idx))
+                if progress_message and (number == 1 or number % 10 == 0 or number == total):
+                    try:
+                        await progress_message.edit_text(
+                            f"🧠 AI javoblarni aniqlayapti... <b>{number}/{total}</b>\n"
+                            f"⏳ Jarayon davom etmoqda, botni yopmang."
+                        )
+                    except Exception:
+                        pass
+                break
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                transient = any(x in msg for x in ("429", "rate limit", "rate_limit", "too many requests", "500", "502", "503", "504", "timeout", "temporarily"))
+                if not transient:
+                    raise
+                delay = min(60.0, max(6.0, 2 ** min(attempt, 5)))
+                log.warning("AI transient error, retry %s/12 in %.1fs: %s", attempt + 1, delay, exc)
+                await asyncio.sleep(delay)
+        else:
+            raise RuntimeError(f"AI javobini aniqlash 12 marta urinilgandan keyin ham muvaffaqiyatsiz: {last_exc}")
+    return solved
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -294,6 +348,7 @@ def admin_menu():
         (("📄 Fayldan test yaratish", "admin:create"),),
         (("📚 Testlarim", "admin:tests"),),
         (("🆔 Mening ID raqamim", "admin:myid"),),
+        (("ℹ️ Yordam", "admin:help"),),
     )
 
 
@@ -322,6 +377,66 @@ async def start_web_server():
     return runner
 
 
+async def begin_new_quiz(user_id: int, message: Message):
+    if not is_admin(user_id):
+        await message.answer("❌ Faqat admin yangi test yarata oladi.")
+        return
+    admin_flow[user_id] = {"step": "file"}
+    await message.answer(
+        "📄 <b>Faylni yuboring</b>\n\n"
+        "Qabul qilinadi: <code>.txt</code> yoki <code>.docx</code>.\n"
+        "Fayldagi savol va variantlar o‘zgartirilmaydi."
+    )
+
+
+@dp.message(Command("newquiz"))
+async def cmd_newquiz(message: Message):
+    await begin_new_quiz(message.from_user.id, message)
+
+
+@dp.message(Command("quizzes"))
+async def cmd_quizzes(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("👋 Sizda hali testlar ro‘yxati yo‘q. Test havolasi orqali testni boshlashingiz mumkin.")
+        return
+    await show_admin_tests(message)
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "📖 <b>Buyruqlar</b>\n\n"
+            "/newquiz — yangi test yaratish\n"
+            "/quizzes — testlaringiz\n"
+            "/stop — faol testni to‘xtatish\n"
+            "/lang — tilni tanlash\n"
+            "/myid — Telegram ID\n"
+            "/help — yordam"
+        )
+    else:
+        await message.answer("📖 /start — testni ochish\n/stop — faol testni to‘xtatish\n/lang — til")
+
+
+@dp.message(Command("lang"))
+async def cmd_lang(message: Message):
+    await message.answer("🌐 Hozircha asosiy til: <b>O‘zbekcha</b>.\nKo‘p tillilik keyingi bosqichda qo‘shilishi mumkin.")
+
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: Message):
+    row = db.execute(
+        "SELECT a.id, t.title FROM attempts a JOIN tests t ON t.id=a.test_id "
+        "WHERE a.user_id=? AND a.finished_at IS NULL ORDER BY a.id DESC LIMIT 1",
+        (message.from_user.id,)
+    ).fetchone()
+    if not row:
+        await message.answer("ℹ️ Faol test topilmadi.")
+        return
+    await finish_attempt(message.from_user.id, row["id"])
+    await message.answer("🛑 Test to‘xtatildi.")
+
+
 @dp.message(Command("myid"))
 async def myid(message: Message):
     await message.answer(f"🆔 Sizning Telegram ID: <code>{message.from_user.id}</code>")
@@ -337,11 +452,11 @@ async def start(message: Message, command: CommandObject):
             await message.answer("❌ Test topilmadi yoki o‘chirilgan.")
             return
         total = db.execute("SELECT COUNT(*) c FROM questions WHERE test_id=?", (row["id"],)).fetchone()["c"]
-        mins = row["duration_sec"] // 60
+        duration_text = format_duration(row["duration_sec"])
         await message.answer(
             f"📚 <b>{row['title']}</b>\n\n"
             f"❓ Savollar: <b>{total}</b>\n"
-            f"⏱ Vaqt: <b>{mins} daqiqa</b>\n\n"
+            f"⏱ Vaqt: <b>{duration_text}</b>\n\n"
             "Boshlash uchun tugmani bosing.",
             reply_markup=kb((("🚀 TESTNI BOSHLASH", f"quiz:start:{public_id}"),))
         )
@@ -366,17 +481,29 @@ async def admin_myid(call: CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data == "admin:help")
+async def admin_help(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo‘q", show_alert=True)
+        return
+    await call.message.answer(
+        "📖 <b>Admin buyruqlari</b>\n\n"
+        "/newquiz — yangi test yaratish\n"
+        "/quizzes — barcha testlar\n"
+        "/stop — faol testni to‘xtatish\n"
+        "/lang — til\n"
+        "/myid — Telegram ID\n"
+        "/help — yordam"
+    )
+    await call.answer()
+
+
 @dp.callback_query(F.data == "admin:create")
 async def admin_create(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         await call.answer("Ruxsat yo‘q", show_alert=True)
         return
-    admin_flow[call.from_user.id] = {"step": "file"}
-    await call.message.answer(
-        "📄 <b>Faylni yuboring</b>\n\n"
-        "Qabul qilinadi: <code>.txt</code> yoki <code>.docx</code>\n\n"
-        "Fayldagi savol va variantlar o‘zgartirilmaydi."
-    )
+    await begin_new_quiz(call.from_user.id, call.message)
     await call.answer()
 
 
@@ -452,19 +579,21 @@ async def text_handler(message: Message):
         flow["chunk"] = count
         flow["step"] = "duration"
         await message.answer(
-            "⏱ Test vaqtini kiriting.\n\n"
-            "Masalan:\n"
-            "• <code>20</code> — 20 daqiqa\n"
-            "• <code>30</code> — 30 daqiqa\n"
-            "• <code>90m</code> — 90 daqiqa\n"
-            "• <code>1h</code> — 1 soat"
+            "⏱ <b>Test vaqtini kiriting</b>.\n\n"
+            "<code>1s</code> — 1 sekund\n"
+            "<code>30s</code> — 30 sekund\n"
+            "<code>60s</code> — 60 sekund\n"
+            "<code>5m</code> — 5 daqiqa\n"
+            "<code>1h</code> — 1 soat\n"
+            "Istalgan katta <code>Ns</code> ham qabul qilinadi.\n"
+            "Faqat son kiritsangiz, daqiqa deb olinadi."
         )
         return
 
     if flow.get("step") == "duration":
         duration = parse_duration(message.text)
         if duration is None:
-            await message.answer("❌ Vaqt noto‘g‘ri. Masalan: <code>20</code> yoki <code>1h</code>.")
+            await message.answer("❌ Vaqt noto‘g‘ri. Masalan: <code>1s</code>, <code>30s</code>, <code>5m</code> yoki <code>1h</code>.")
             return
 
         flow["duration"] = duration
@@ -487,7 +616,7 @@ async def text_handler(message: Message):
         )
 
         try:
-            solved = await solve_questions(items)
+            solved = await solve_questions(items, progress_message=message)
         except Exception as exc:
             log.exception("AI solving failed")
             await message.answer(
@@ -529,27 +658,30 @@ async def text_handler(message: Message):
         return
 
 
-@dp.callback_query(F.data == "admin:tests")
-async def admin_tests(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Ruxsat yo‘q", show_alert=True)
-        return
+async def show_admin_tests(message: Message):
     rows = db.execute(
         "SELECT * FROM tests WHERE created_by=? ORDER BY id DESC LIMIT 30",
         (ADMIN_ID,)
     ).fetchall()
     if not rows:
-        await call.message.answer("📚 Hali testlar yo‘q.")
-        await call.answer()
+        await message.answer("📚 Hali testlar yo‘q.")
         return
-
     username = await bot_username()
-    lines = ["📚 <b>Testlar</b>\n"]
+    lines = ["📚 <b>Testlaringiz</b>\n"]
     for r in rows:
         total = db.execute("SELECT COUNT(*) c FROM questions WHERE test_id=?", (r["id"],)).fetchone()["c"]
-        lines.append(f"• <b>{r['title']}</b> — {total} ta")
+        attempts = db.execute("SELECT COUNT(*) c FROM attempts WHERE test_id=?", (r["id"],)).fetchone()["c"]
+        lines.append(f"• <b>{r['title']}</b> — {total} ta savol — {attempts} ta urinish")
         lines.append(test_link(r["public_id"], username))
-    await call.message.answer("\n".join(lines))
+    await message.answer("\n".join(lines))
+
+
+@dp.callback_query(F.data == "admin:tests")
+async def admin_tests(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat yo‘q", show_alert=True)
+        return
+    await show_admin_tests(call.message)
     await call.answer()
 
 
@@ -580,7 +712,7 @@ async def quiz_start(call: CallbackQuery):
     await call.message.edit_text(
         f"🚀 <b>{test['title']}</b>\n\n"
         f"❓ {total} ta savol\n"
-        f"⏱ {test['duration_sec']//60} daqiqa\n\n"
+        f"⏱ {format_duration(test['duration_sec'])}\n\n"
         "Test boshlandi!"
     )
     await send_question(call.from_user.id, attempt_id, 1)
@@ -687,7 +819,7 @@ def is_attempt_owner(attempt_id: int, user_id: int) -> bool:
     return bool(row and row["user_id"] == user_id)
 
 
-async def finish_attempt(user_id: int, attempt_id: int):
+async def finish_attempt(user_id: int, attempt_id: int, reason: str = "manual"):
     attempt = db.execute("""
         SELECT a.*, t.title FROM attempts a JOIN tests t ON t.id=a.test_id
         WHERE a.id=? AND a.user_id=? AND a.finished_at IS NULL
@@ -713,7 +845,7 @@ async def finish_attempt(user_id: int, attempt_id: int):
     percent = round(score / attempt["total"] * 100, 1) if attempt["total"] else 0
     await bot.send_message(
         user_id,
-        f"🏁 <b>TEST YAKUNLANDI</b>\n\n"
+        f"{'⏰ <b>VAQT TUGADI</b>' if reason == 'timeout' else '🏁 <b>TEST YAKUNLANDI</b>'}\n\n"
         f"📚 {attempt['title']}\n"
         f"✅ To‘g‘ri: <b>{score}</b>\n"
         f"❌ Noto‘g‘ri/bo‘sh: <b>{attempt['total'] - score}</b>\n"
@@ -722,10 +854,38 @@ async def finish_attempt(user_id: int, attempt_id: int):
     )
 
 
+async def expire_attempts_loop():
+    """Finish timed-out attempts even if the user sends no further message."""
+    while True:
+        try:
+            rows = db.execute(
+                "SELECT a.id, a.user_id FROM attempts a JOIN tests t ON t.id=a.test_id "
+                "WHERE a.finished_at IS NULL AND (? - a.started_at) >= t.duration_sec",
+                (now(),)
+            ).fetchall()
+            for row in rows:
+                await finish_attempt(row["user_id"], row["id"], reason="timeout")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Attempt expiry loop failed")
+        await asyncio.sleep(1)
+
+
 async def main():
     runner = await start_web_server()
+    expiry_task = asyncio.create_task(expire_attempts_loop())
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Botni boshlash"),
+            BotCommand(command="newquiz", description="Yangi test yaratish"),
+            BotCommand(command="quizzes", description="Testlarim"),
+            BotCommand(command="stop", description="Faol testni to‘xtatish"),
+            BotCommand(command="lang", description="Tilni tanlash"),
+            BotCommand(command="help", description="Yordam"),
+            BotCommand(command="myid", description="Telegram ID"),
+        ])
         log.info("Starting polling")
         await dp.start_polling(
             bot,
@@ -733,6 +893,11 @@ async def main():
             tasks_concurrency_limit=20,
         )
     finally:
+        expiry_task.cancel()
+        try:
+            await expiry_task
+        except asyncio.CancelledError:
+            pass
         await runner.cleanup()
         await bot.session.close()
         db.close()
